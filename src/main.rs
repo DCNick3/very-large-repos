@@ -88,7 +88,7 @@ static BANNED_REPOS: Lazy<HashSet<String>> = Lazy::new(|| {
     )
 });
 
-const REPO_COUNT: usize = 200;
+const REPO_COUNT: usize = 1000;
 
 fn pre_filter_repo(repo: &Repository) -> bool {
     let repo_name = repo.full_name.as_deref().unwrap_or_default();
@@ -319,7 +319,7 @@ async fn get_repo_list(
         let repo_name = repo.full_name.as_deref().unwrap();
         info!("Pass: {}", repo_name);
 
-        repo_list.push(format!("git@github.com:{}", repo_name));
+        repo_list.push(repo_name.to_string());
         span.pb_set_position(repo_list.len() as u64);
         if repo_list.len() >= REPO_COUNT {
             break;
@@ -343,7 +343,7 @@ async fn make_rate_limiter(rate: Rate) -> Result<DefaultRateLimiter> {
 async fn main_impl() -> Result<()> {
     let token = std::env::var("GITHUB_TOKEN").expect("GITHUB_TOKEN env variable is required");
 
-    let crab = octocrab::Octocrab::builder()
+    let crab = Octocrab::builder()
         .personal_token(token)
         .build()
         .context("Building octocrab")?;
@@ -361,7 +361,7 @@ async fn main_impl() -> Result<()> {
     let repos = crab
         .search()
         .repositories("stars:>10 forks:>10 language:Rust")
-        .sort("size")
+        .sort("stars")
         .order("desc")
         .send()
         .await
@@ -383,13 +383,13 @@ async fn main() -> Result<()> {
     let _enabled = ansi_term::enable_ansi_support();
 
     let indicatif_layer = IndicatifLayer::new();
-    let mut stderr = indicatif_layer.get_stderr_writer();
+    let stderr = indicatif_layer.get_stderr_writer();
 
     tracing_subscriber::EnvFilter::try_from_default_env()
         .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new(DEFAULT_ENV_FILTER))
         .with_subscriber(
             tracing_subscriber::registry()
-                .with(tracing_subscriber::fmt::layer().with_writer(stderr.clone()))
+                .with(tracing_subscriber::fmt::layer().with_writer(stderr))
                 .with(indicatif_layer),
         )
         .init();
