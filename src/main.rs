@@ -13,8 +13,10 @@ use octocrab::{FromResponse, Octocrab, Page};
 use once_cell::sync::Lazy;
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
+use serde_json::json;
 use snafu::GenerateImplicitData;
-use std::collections::HashSet;
+use std::collections::{BTreeMap, HashSet};
+use std::fs::File;
 use std::num::NonZeroU32;
 use std::sync::Arc;
 use tracing::{info, instrument, Instrument, Span};
@@ -100,6 +102,11 @@ fn pre_filter_repo(repo: &Repository) -> bool {
 
     if BANNED_REPOS.contains(repo_name) {
         info!("Pre-skip: Banned: {}", repo_name);
+        return false;
+    }
+
+    if repo.language != Some(json!("Rust")) {
+        info!("Pre-skip: Language: {}", repo_name);
         return false;
     }
 
@@ -232,6 +239,27 @@ async fn filter_repo(
         .until_ready()
         .instrument(tracing::info_span!("wait_rate_limit"))
         .await;
+    let languages: BTreeMap<String, u32> = crab
+        .get(format!("/repos/{repo_name}/languages"), None::<&()>)
+        .await
+        .context("Getting the languages")?;
+
+    let gh_rust_count = languages.get("Rust").copied().unwrap_or_default();
+    let gh_other_count = languages
+        .iter()
+        .filter(|&(k, _)| k != "Rust")
+        .map(|(_, &v)| v)
+        .sum::<u32>();
+    let gh_rust_percentage = gh_rust_count as f64 / (gh_rust_count + gh_other_count) as f64;
+    if gh_rust_percentage < 0.51 {
+        info!("Skip: GH rust percentage: {}", repo_name);
+        return Ok(false);
+    }
+
+    rate_limiter
+        .until_ready()
+        .instrument(tracing::info_span!("wait_rate_limit"))
+        .await;
     let page: Page<Commit> = crab
         .get(
             format!("/repos/{repo_name}/commits?per_page=1",),
@@ -294,7 +322,10 @@ async fn get_repo_list(
     crab: &Octocrab,
     repos: impl Stream<Item = Result<Repository>>,
     core_rate_limiter: &DefaultRateLimiter,
+    output: &mut File,
 ) -> Result<Vec<String>> {
+    use std::io::Write;
+
     let span = Span::current();
     span.pb_set_style(&progressbar_style());
     span.pb_set_length(REPO_COUNT as u64);
@@ -320,6 +351,7 @@ async fn get_repo_list(
         info!("Pass: {}", repo_name);
 
         repo_list.push(repo_name.to_string());
+        writeln!(output, "{}", repo_name).context("Writing repo list")?;
         span.pb_set_position(repo_list.len() as u64);
         if repo_list.len() >= REPO_COUNT {
             break;
@@ -368,9 +400,14 @@ async fn main_impl() -> Result<()> {
         .context("Getting repos")?;
     let repos = stream::into_stream(repos, &crab, search_rate_limiter.clone());
 
-    let repos = get_repo_list(&crab, repos, &core_rate_limiter).await?;
+    let mut file = File::create("repo-list.txt").context("Creating repo list file")?;
+    let repos = get_repo_list(&crab, repos, &core_rate_limiter, &mut file).await?;
+    drop(file);
 
-    std::fs::write("repo-list.txt", repos.join("\n")).context("Writing repo list")?;
+    info!(
+        "Found {} repos! They were written to `repo-list.txt`",
+        repos.len()
+    );
 
     Ok(())
 }
